@@ -1,6 +1,5 @@
 // src/components/ZoneModal.jsx
 import { useEffect, useRef } from "react";
-import { v4 as uuid } from "uuid";
 
 /**
  * Props
@@ -38,7 +37,7 @@ export default function ZoneModal({ open, rawGeo, onCancel, onSave }) {
     };
 
     /* keep existing id when editing, generate new when adding */
-    const id = rawGeo?.properties?.id ?? uuid();
+    const id = rawGeo?.properties?.id ?? crypto.randomUUID();
 
     onSave({
       ...rawGeo,
