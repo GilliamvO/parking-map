@@ -9,8 +9,9 @@ export default function useDraw(map, onSave) {
     const drawn = new L.FeatureGroup().addTo(map);
     map.addControl(
       new L.Control.Draw({
-        edit: { featureGroup: drawn },
-        draw: { polygon: true, rectangle: false, circle: false, polyline: false, marker: false }
+        edit:false,                          // disable built-in Edit/Delete bar
+        draw : { polygon:true,               // only one button left
+           rectangle:false, circle:false, polyline:false, marker:false }
       })
     );
 

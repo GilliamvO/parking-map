@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect } from "react";
+import { supa } from "./lib/supa";
 import dayjs from "dayjs";
 import { MapContainer, TileLayer, GeoJSON } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
@@ -8,17 +9,50 @@ import DrawControl from "./DrawControl.jsx";
 import ZoneModal from "./components/ZoneModal.jsx";
 import { zoneStatus } from "./utils/zoneHelpers";
 import ZoneDrawer from "./components/ZoneDrawer.jsx";
+import { zoneMatchesWeeklyWindow } from "./utils/planHelpers";
 
 const LS_KEY = "parking-zones";
 
 export default function App() {
-  // ---------- 1 · zones state ----------
-  const [zones, setZones] = useState(() => {
-    const saved = localStorage.getItem(LS_KEY);
-    return saved
-      ? JSON.parse(saved)
-      : { type: "FeatureCollection", features: [] };
-  });
+const [zones, setZones] = useState({ type:"FeatureCollection", features:[] });
+const [plan, setPlan] = useState({
+  days: [1,2,3,4,5],   // default Mon-Fri
+  start: "21:00",
+  end:   "00:30",
+});
+// 1 ► initial fetch
+useEffect(() => {
+  supa.from("zones")
+      .select("geojson")
+      .then(({ data }) =>
+        setZones({ type:"FeatureCollection", features:data.map(d=>d.geojson) }));
+}, []);
+
+// 2 ► realtime subscription (broadcasts to all tabs/devices)
+useEffect(() => {
+  const sub = supa.channel("zones")
+    .on("postgres_changes", { event:"*", schema:"public", table:"zones" },
+      payload => {
+        if (payload.eventType === "DELETE") {
+          setZones(p => ({ ...p, features: p.features.filter(f => f.properties.id !== payload.old.id) }));
+        } else {                // INSERT or UPDATE
+          setZones(p => {
+            const others = p.features.filter(f => f.properties.id !== payload.new.id);
+            return { ...p, features:[...others, payload.new.geojson] };
+          });
+        }
+      })
+    .subscribe();
+  return () => sub.unsubscribe();
+}, []);
+
+// ---------- 1 · zones state ----------
+  // const [zones, setZones] = useState(() => {
+  //   const saved = localStorage.getItem(LS_KEY);
+  //   return saved
+  //     ? JSON.parse(saved)
+  //     : { type: "FeatureCollection", features: [] };
+  // });
 
   // ---------- 2 · modal control ----------
 const [pendingGeo, setPendingGeo]   = useState(null); // create mode
@@ -43,37 +77,52 @@ const handleModalCancel = () => {
   setEditingFeature(null);
 };
 
-const handleModalSave = (feat) => {
-  setZones((prev) => {
-    const exists = prev.features.find((f) => f.properties.id === feat.properties.id);
-    return exists
-      ? { ...prev, features: prev.features.map((f) => (f.properties.id === feat.properties.id ? feat : f)) }
-      : { ...prev, features: [...prev.features, feat] };
+const handleModalSave = async (feat) => {
+  // 1. optimistic UI update – keep as-is
+  setZones(prev => {
+    const others = prev.features.filter(f => f.properties.id !== feat.properties.id);
+    return { ...prev, features: [...others, feat] };
   });
+
+  // 2. 🔄 persist to Supabase
+  await supa
+    .from("zones")
+    .upsert({ id: feat.properties.id, geojson: feat }, { onConflict: "id" });
+
   setPendingGeo(null);
   setEditingFeature(null);
 };
-const handleDelete = (id) =>
-  setZones((prev) => ({
+const handleDelete = async (id) => {
+  // optimistic removal from UI
+  setZones(prev => ({
     ...prev,
-    features: prev.features.filter((f) => f.properties.id !== id),
+    features: prev.features.filter(f => f.properties.id !== id),
   }));
-  // ---------- 3 · persist every change ----------
-  useEffect(
-    () => localStorage.setItem(LS_KEY, JSON.stringify(zones)),
-    [zones]
-  );
+
+  // 🔄 remove from Supabase
+  await supa.from("zones").delete().eq("id", id);
+};
 
   // ---------- 4 · time period (for now: "current moment") ----------
   const now = new Date();
   const nowPlus = new Date(now.getTime() + 60000); // +1 min so the loop runs
   const nowPeriod = { start: now, end: nowPlus };
+  
+  const toggleDay = (d) =>
+  setPlan(p =>
+    p.days.includes(d)
+      ? { ...p, days: p.days.filter(x => x !== d) }
+      : { ...p, days: [...p.days, d] }
+  );
+
+  
   // ---------- 5 · render ----------
   return (
     <>
       <div className="fixed inset-0">
 
       <MapContainer
+        zoomControl={false}
         center={[52.633730749385165, 4.747211876277656]}
         zoom={15}
         className="h-full w-full"
@@ -83,10 +132,16 @@ const handleDelete = (id) =>
         <DrawControl onPolygon={handlePolygonDrawn} />
 
         {zones.features.map((f) => {
-            const s = zoneStatus(f, period.start, period.end);
-            const colour =
-              s === "allowed"   ? "green"  :
-              s === "forbidden" ? "red"    : "orange";
+          /* ⇣ calculate status for THIS feature */
+          const s =
+            mode === "now"
+              ? zoneStatus(f, new Date(), new Date(Date.now() + 60_000))
+              : zoneMatchesWeeklyWindow(f, plan);
+
+          const colour =
+            s === "allowed"   ? "green"
+            : s === "forbidden" ? "red"
+            : "orange";
 
             return (
               <GeoJSON
@@ -117,7 +172,7 @@ const handleDelete = (id) =>
 {!showList && (
   <button
     className="
-      fixed bottom-2 right-2                /* phone */
+      fixed bottom-14 right-2 sm:bottom-auto sm:top-2                /* phone */
       sm:top-2 sm:right-2 sm:bottom-auto    /* ↗ desktop; cancel bottom-2 */
       z-[1101] rounded-md border border-gray-400 bg-white
       px-3 py-1 text-sm font-medium text-black shadow
@@ -127,50 +182,43 @@ const handleDelete = (id) =>
     Zones
   </button>
 )}
-<div
-  className="
-    fixed left-1/2 top-2 z-[1101] -translate-x-1/2
-    flex items-center gap-3 rounded-md border border-gray-400
-    bg-white px-4 py-1 text-sm text-black shadow
-  "
->
-  <label>
-    <input
-      type="radio"
-      name="mode"
-      value="now"
-      checked={mode==="now"}
-      onChange={()=>setMode("now")}
-    /> Now
+
+{/* responsive top toolbar */}
+
+<div className="fixed left-1/2 top-2 z-[1101] -translate-x-1/2
+                flex flex-wrap items-center gap-2 rounded-md
+                border border-gray-400 bg-white px-3 py-1 text-sm text-black shadow">
+
+  <label className="flex items-center gap-1">
+    <input type="radio" name="mode" value="now"
+           checked={mode==="now"} onChange={()=>setMode("now")} /> Now
   </label>
 
-  <label>
-    <input
-      type="radio"
-      name="mode"
-      value="plan"
-      checked={mode==="plan"}
-      onChange={()=>setMode("plan")}
-    /> Plan
+  <label className="flex items-center gap-1">
+    <input type="radio" name="mode" value="plan"
+           checked={mode==="plan"} onChange={()=>setMode("plan")} /> Plan
   </label>
 
   {mode==="plan" && (
     <>
-      <input
-        type="datetime-local"
-        value={planFrom.format("YYYY-MM-DDTHH:mm")}
-        onChange={(e)=>setPlanFrom(dayjs(e.target.value))}
-        max={planTo.format("YYYY-MM-DDTHH:mm")}
-        style={{fontSize:".85rem"}}
-      />
+      {/* weekday chips */}
+      {["S","M","T","W","T","F","S"].map((d,i)=>(
+        <button key={i}
+          className={`h-7 w-7 rounded-full border
+            ${plan.days.includes(i) ? "bg-blue-600 text-white" : "bg-white"}
+          `}
+          onClick={()=>toggleDay(i)}
+        >{d}</button>
+      ))}
+
+      {/* time pickers – 24 h, never wider than viewport */}
+      <input type="time" value={plan.start}
+             onChange={e=>setPlan(p=>({...p,start:e.target.value}))}
+             className="w-[5.5rem]"/>
       →
-      <input
-        type="datetime-local"
-        value={planTo.format("YYYY-MM-DDTHH:mm")}
-        onChange={(e)=>setPlanTo(dayjs(e.target.value))}
-        min={planFrom.format("YYYY-MM-DDTHH:mm")}
-        style={{fontSize:".85rem"}}
-      />
+      <input type="time" value={plan.end}
+             onChange={e=>setPlan(p=>({...p,end:e.target.value}))}
+             className="w-[5.5rem]"/>
     </>
   )}
 </div>  
